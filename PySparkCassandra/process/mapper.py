@@ -1,38 +1,37 @@
-import time
+import json
+import math
+import datetime
 
 from json import JSONDecodeError
 
-import requests
 from pyspark.sql import SparkSession
+from pyspark.sql.types import *
 
-from service import log_manager
-from service.redis_ops import save_dict_to_redis
+import pyspark.sql.functions as F
+
+from util import log_manager
 from util import io_utils
 
-APP_NAME = "FCM-Recommend-Mapper"
-SPARK_MASTER = "local[24]"
-MAX_TIME_USER_AVAILABLE = 180 * 86400000  # 180 days
-CURRENT_MILLI_TIME = int(round(time.time() * 1000))
-REDIS_FCM_BRANDMODEL_IIDS_KEY = "dm_fcm_brandmodel_iids"
-URL_UPDATE_MAPPED_DATA = "https://log.indianauto.com/DataMiningAPI/fcm-token-map"
+CASSANDRA_FORMAT = "org.apache.spark.sql.cassandra"
+STORE_ID = 2
+EVENT_CLICK = 2
 
 
-class SparkMapper:
+class SparkProcess:
 
-    def __init__(self, list_tuple_usid_token):
+    def __init__(self, app_name, master):
         cassandra_config_file = "settings/cassandra-config.json"
         self.log = log_manager.get_logger(self.__class__.__name__)
         try:
             config = io_utils.read_json(cassandra_config_file)
-            self.spark = SparkSession.builder.appName(APP_NAME).master(SPARK_MASTER) \
+            self.spark = SparkSession.builder.appName(app_name).master(master) \
                 .config('spark.jars.packages', 'com.datastax.spark:spark-cassandra-connector_2.11:2.5.0') \
                 .config('spark.cassandra.connection.host', config.host) \
-                .config('spark.cassandra.connection.port', str(config.port)) \
+                .config('spark.cassandra.connection.port', config.port) \
                 .config('spark.cassandra.auth.username', config.username) \
                 .config('spark.cassandra.auth.password', config.password) \
                 .config('spark.sql.extensions', 'com.datastax.spark.connector.CassandraSparkExtensions') \
                 .getOrCreate()
-            self.list_tuple_usid_token = list_tuple_usid_token
         except JSONDecodeError:
             self.log.error("Failed to load Cassandra config json file")
         except FileNotFoundError as f_error:
@@ -40,12 +39,10 @@ class SparkMapper:
         except TypeError:
             self.log.exception("Invalid json config parsing from file")
 
-    def map(self):
+    def process(self):
         """
-        - Run a Spark job to map firebase token with user session ids and theirs
-        trained model related to brand/model auto attributes
-        - Output of the job is saved to Redis containing the brand/model as key
-        and firebase tokens list as value
+        - Run a Spark job to extract merchandises that have most "Add To Cart" button clicked
+        on store having store_id = 1
 
         :return: none
         """
@@ -53,118 +50,123 @@ class SparkMapper:
             self.log.info("PySpark has failed to initialize. No mapper will be processed")
             return
 
-        df_usid_token = self.spark.createDataFrame(self.list_tuple_usid_token, ['user_session_id', 'fcm_token'])
-        df_recommend_data = self.spark.read.format("org.apache.spark.sql.cassandra") \
-            .options(keyspace="recommendation_indianauto", table="results") \
-            .load() \
-            .select("user_session_id", "attr_ids", "time")
+        # Define the date range to read from Cassandra
+        from_date = datetime.datetime(2020, 1, 1, 0, 0)
+        to_date = datetime.datetime.now()
 
-
-        df_token_brand_model = df_usid_token \
-            .join(df_recommend_data, df_usid_token.user_session_id == df_recommend_data.user_session_id)
-            # .map(lambda row: (row[0][1], row[1][1], row[1][2])) \
-            # .filter(lambda row: row[2] + MAX_TIME_USER_AVAILABLE >= CURRENT_MILLI_TIME)
-
-        df_usid_token.explain()
-        df_token_brand_model.explain()
-
-        # print(df_token_brand_model.toDF().printSchema())
+        # - Since the "user_logs" store extremely large data (around tens of millions rows per day),
+        # it is hard to store all data on a local computer's RAM
+        # - Instead, we will divide the date range in multiple "days", and perform needed
+        # aggregations per day, and union into a final results. This will save a lot of RAM
+        # and make it possible to read billions of records of event logs using just one normal
+        # machine (running Spark in local mode)
         #
-        # rdd = df_token_brand_model.flatMap(lambda row: _flat_map_brand_model(row))
-        # results = rdd.groupByKey().mapValues(_map_values_no_dups).collect()
-        #
-        # self.log.info(f"Total mapped elements: {len(results)}")
-        # self.log.info(results)
-        # self.save_results_to_redis(results)
+        # Below is a process reading 20 billions of rows in the event logs using a 8 GB RAM PC
+        diff = to_date - from_date
+        days_diff = math.ceil(diff.days + diff.seconds / 86400)
+        df_final_results = None
 
-    def save_results_to_redis(self, results):
-        """
-        Save the brand-model -> list of user session ids dictionary
-        to Redis local for later observation
+        for i in range(days_diff + 1):
+            to = from_date + datetime.timedelta(days=1) - datetime.timedelta(hours=1)
+            df_temp = self.create_log_dataframe(from_date, to) \
+                .rdd \
+                .filter(lambda row: _filter_btn_add_to_cart_clicked(row)) \
+                .map(lambda row: _map_to_output(row)) \
+                .toDF("date") \
+                .groupBy("date") \
+                .count()
 
-        :param results: a dictionary with key being a pair of brand id
-        and model id and value is a list of user session ids
-
-        :return: No return
-        """
-        results_as_dict = {k: ",".join(v) for (k, v) in results}
-        save_dict_to_redis(REDIS_FCM_BRANDMODEL_IIDS_KEY, results_as_dict)
-        self.log.info("Saved mapped data to local Redis successfully!")
-        # self.send_update_to_server(results_as_dict)
-
-    def send_update_to_server(self, dict_json, count_per_request=100):
-        """
-        Send multiple post requests to server to update production Redis Cluster server
-
-        :param dict_json: a dictionary representing as a request body
-        :param count_per_request: use this to divide one request to multiple ones
-        to avoid high load to production server API
-
-        :return: No return
-        """
-        temp_dict = {}
-        success = 0
-
-        def _process_request():
-            response = requests.post(URL_UPDATE_MAPPED_DATA, json=temp_dict)
-            json_resp = response.json()
-            if response.status_code == 200 and json_resp and "message" in json_resp \
-                    and json_resp["message"] == "OK":
-                self.log.info("Process Mapper has sent POST request to update mapped data successfully")
-                return 1
+            if df_final_results is None:
+                df_final_results = df_temp
             else:
-                self.log.info(
-                    f"Something not right. Response body from API: {response.content}"
-                    f" with status code = {response.status_code}")
-                return 0
+                df_final_results = df_final_results.union(df_temp)
 
-        if len(dict_json) <= count_per_request:
-            temp_dict = dict_json
-        else:
-            for k, v in dict_json.items():
-                temp_dict[k] = v
-                if len(temp_dict) == count_per_request:
-                    success += _process_request()
+        df_final_results.show(truncate=False)
+        """
+        The showed results represent the total Add-To-Cart Button click per day, example:
+        
+        +--------+--------+
+        |  date  |  count |
+        +--------+--------+
+        |20200613|   13   |
+        +--------+--------+
+        |20200614|   212  |
+        +--------+--------+
+        |20200615|   131  |
+        +--------+--------+
+        |20200616|    1   |
+        +--------+--------+
+        |20200617|   26   |
+        +--------+--------+
+        """
 
-        if temp_dict:
-            success += _process_request()
+    def create_log_dataframe(self, from_date, to_date):
+        selected_cols = ["store_id", "year", "month", "day", "hour", "log_time", "url", "detail"]
 
-        self.log.info(f"Updated mapped data with "
-                      f"{success}/{dict_json / count_per_request + 1} successful POST requests")
+        df_full_user_logs = self.spark.read.format(CASSANDRA_FORMAT) \
+            .options(keyspace="demo_kp", table="user_log") \
+            .load() \
+            .select(selected_cols) \
+            .where(f"event_id = {EVENT_CLICK}")
+
+        df_partition_keys = self.create_partition_dataframe(from_date, to_date)
+
+        # Joining a dataframe with partition keys with Cassandra dataframe will make
+        # Spark perform DirectJoin, which is much more efficient comparing to traditional Spark Scanning
+        return df_partition_keys.join(df_full_user_logs,
+                                      on=(df_partition_keys.store_id == df_full_user_logs.store)
+                                         & (df_partition_keys.year == df_full_user_logs.year)
+                                         & (df_partition_keys.month == df_full_user_logs.month)
+                                         & (df_full_user_logs.day == df_full_user_logs.day)
+                                         & (df_partition_keys.hour == df_full_user_logs.hour)
+                                      ) \
+            .select("log_time", "url", "detail") \
+            .filter(F.col("url").rlike("^<some-regex-here>$")) \
+            .filter(F.col("detail").isNotNull()) \
+            .cache()
+
+    def create_partition_dataframe(self, from_date, to_date):
+        partition_keys = self.create_user_logs_partition_keys(from_date, to_date)
+        schema = StructType([
+            StructField("store_id", IntegerType(), False),
+            StructField("year", IntegerType(), False),
+            StructField("month", IntegerType(), False),
+            StructField("day", IntegerType(), False),
+            StructField("hour", IntegerType(), False),
+        ])
+
+        return self.spark.createDataFrame(partition_keys, schema)
+
+    def create_user_logs_partition_keys(self, from_date, to_date):
+        diff = to_date - from_date
+        hours_diff = diff.days * 24 + diff.seconds // 3600
+
+        partition_keys = []
+        for i in range(hours_diff + 1):
+            partition_keys.append((STORE_ID, from_date.year, from_date.month,
+                                   from_date.day, from_date.hour))
+            from_date += datetime.timedelta(hours=1)
+
+        return partition_keys
 
 
-def _flat_map_brand_model(row):
-    """
-    Flat the given Spark data frame Row to multiple rows
-    Each Row has 2 columns: firebase instance ID (fcm_token) and a list of attribute IDs (attr_ids)
-    Logic is to flat the row to many rows having structure:
-        [brandId_modelId, list of firebase instance IDs] (2 columns)
+def _filter_btn_add_to_cart_clicked(row):
+    detail = row.detail
+    if detail:
+        dict_detail = json.loads(detail)
+        if dict_detail["click_target"]:
+            dict_click_target = dict_detail["click_target"]
+            if dict_click_target["btn-id"] is "add-to-cart":
+                return True
 
-    :param row: a Spark dataframe Row
-    :return: a list of row after flatting
-    """
-    top_count = 3
-    brand_shift = 11
-    model_shift = 22
-    brand_mask = 0x7ff
-    model_mask = 0xffff
-    fcm_token = row[0]
-    attr_ids = row[1]
-
-    temp_dict = {}
-    for attr_id in attr_ids[:top_count]:
-        brand_id = (attr_id >> brand_shift) & brand_mask
-        model_id = (attr_id >> model_shift) & model_mask
-        temp_dict[f"{brand_id}_{model_id}"] = fcm_token
-
-    return [(k, v) for k, v in temp_dict.items()]
+    return False
 
 
-def _map_values_no_dups(iterable):
-    """
-    Remove duplicates from an iterable object
+def _map_to_output(row):
+    log_time = row.log_time
+    return [convert_to_date_int(log_time)]  # spark dataframe only accepts list, tuples, Row object...
 
-    :param iterable: an iterable object (can be list, set, etc.)
-    :return: a list of unique elements
-    """
-    return list(set(iterable))
+
+def convert_to_date_int(time_milli):
+    d = datetime.datetime.fromtimestamp(time_milli / 1000)
+    return int("{}{:02d}{:02d}".format(d.year, d.month, d.day))

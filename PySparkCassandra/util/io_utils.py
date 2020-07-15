@@ -9,7 +9,7 @@ def read_json(file):
         return json_to_obj(data_as_string)
 
 
-def json_to_obj(data): return json.loads(data, object_hook=__json_object_hook)
+def json_to_obj(data): return json.loads(data, object_hook=_json_object_hook)
 
 
-def __json_object_hook(d): return namedtuple('', d.keys())(*d.values())
+def _json_object_hook(d): return namedtuple('', d.keys())(*d.values())
